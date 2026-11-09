@@ -163,6 +163,12 @@ public class TableImpl implements Table {
     return new TransactionBuilderImpl(this, engineInfo, operation);
   }
 
+  @Override
+  public TransactionBuilder createTransactionBuilder(
+      Engine engine, String engineInfo, Operation operation, long readVersion) {
+    return new TransactionBuilderImpl(this, engineInfo, operation).withReadVersion(readVersion);
+  }
+
   public TransactionBuilder createReplaceTableTransactionBuilder(Engine engine, String engineInfo) {
     return new ReplaceTableTransactionBuilderImpl(this, engineInfo);
   }

@@ -133,6 +133,22 @@ public interface Table {
       Engine engine, String engineInfo, Operation operation);
 
   /**
+   * Create a {@link TransactionBuilder} which can create a {@link Transaction} object to mutate the
+   * table with respect to a specific read snapshot version.
+   *
+   * @param engine {@link Engine} instance to use.
+   * @param engineInfo information about the engine that is making the updates.
+   * @param operation metadata of operation that is being performed. E.g. "insert", "delete".
+   * @param readVersion snapshot version to read.
+   * @return {@link TransactionBuilder} instance to build the transaction.
+   * @since 3.2.0
+   */
+  default TransactionBuilder createTransactionBuilder(
+      Engine engine, String engineInfo, Operation operation, long readVersion) {
+    return createTransactionBuilder(engine, engineInfo, operation).withReadVersion(readVersion);
+  }
+
+  /**
    * Checkpoint the table at given version. It writes a single checkpoint file.
    *
    * @param engine {@link Engine} instance to use.

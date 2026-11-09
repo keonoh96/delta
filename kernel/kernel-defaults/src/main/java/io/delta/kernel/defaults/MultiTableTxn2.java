@@ -35,6 +35,7 @@ import io.delta.kernel.defaults.engine.hadoopio.HadoopFileIO;
 import io.delta.kernel.defaults.internal.data.DefaultColumnarBatch;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.hook.PostCommitHook;
+import io.delta.kernel.internal.util.FileNames;
 import io.delta.kernel.types.IntegerType;
 import io.delta.kernel.types.StringType;
 import io.delta.kernel.types.StructField;
@@ -319,8 +320,20 @@ public class MultiTableTxn2 {
     MetricsExporter.appendSummaryToJson(summaryFileName);
   }
 
+  private static void deleteFiles(List<String> filePaths) {
+    for (String path : filePaths) {
+      try {
+        s3.delete(path);
+      } catch (Exception e) {
+        // ignore failure to delete
+      }
+    }
+  }
+
   private static void runRavenExpImpl() {
-    // Keep running until flag change
+    int[] tablePrevVids = new int[TPCDSSchema.SCHEMA_LIST.size()];
+    long[] tableDeltaVersions = new long[TPCDSSchema.SCHEMA_LIST.size()];
+    // Keep running for given number of txns
     for (int i = 0; i < numTxn; i++) {
       List<Integer> tableIdxList = ThreadLocalRandom.current()
               .ints(0, TPCDSSchema.SCHEMA_LIST.size())
@@ -330,6 +343,7 @@ public class MultiTableTxn2 {
               .collect(Collectors.toList());
 
       List<List<File2>> fileLogs = Lists.newArrayList();
+      List<String> createdFiles = Lists.newArrayList();
 
       Instant beforeLoadTables = Instant.now();
 
@@ -352,14 +366,42 @@ public class MultiTableTxn2 {
         String tableName = TPCDSSchema.SCHEMA_NAMES.get(tableIdx);
         String location = String.format("%s/%s.db/%s", warehouseLocation, dbName, tableName);
         Table table = Table.forPath(engine, location);
-        TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.WRITE);
-        Transaction txn = txnBuilder.build(engine);
-        Row txnState = txn.getTransactionState(engine);
+
         // brute force way to sort table objects. Should not take too long
-        Optional<TableObject> tableObject = unsortedTableObjects.stream()
+        Optional<TableObject> tableObjectOpt = unsortedTableObjects.stream()
                 .filter(t -> t.getTableName().equals(tableName)) // The Predicate
                 .findFirst();
-        tableObjects.add(tableObject.get());
+        TableObject tableObject = tableObjectOpt.get();
+
+        int prevVid = tablePrevVids[tableIdx];
+        long deltaLogVersion = tableDeltaVersions[tableIdx];
+        if (tableObject.getSnapshotVid() > prevVid) {
+          String deltaQuery = String.format(Locale.getDefault(),
+                  "SELECT file_path FROM FILELIST DELTA TableSnapshot(%d, %d, %d)",
+                  tableObject.getSnapshotObjId(), prevVid, tableObject.getSnapshotVid());
+          byte[] deltaResultSet = ravenCatalog.execQuery(deltaQuery);
+          RavenCatalog.BufIterator deltaBufIter = new RavenCatalog.BufIterator(deltaResultSet);
+          while (deltaBufIter.valid()) {
+            String action = new String(deltaResultSet, deltaBufIter.dataIdx(), deltaBufIter.elemSize(), UTF_8);
+            deltaBufIter.next();
+            String path = new String(deltaResultSet, deltaBufIter.dataIdx(), deltaBufIter.elemSize(), UTF_8);
+            deltaBufIter.next();
+            if ("add".equals(action) && FileNames.isCommitFile(path)) {
+              long ver = FileNames.deltaVersion(path);
+              deltaLogVersion = Math.max(deltaLogVersion, ver);
+            }
+          }
+          tablePrevVids[tableIdx] = tableObject.getSnapshotVid();
+          tableDeltaVersions[tableIdx] = deltaLogVersion;
+        }
+
+        TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.WRITE)
+                .withReadVersion(deltaLogVersion)
+                .withMaxRetries(0);
+        Transaction txn = txnBuilder.build(engine);
+        Row txnState = txn.getTransactionState(engine);
+
+        tableObjects.add(tableObject);
         tables.add(table);
         txns.add(txn);
         txnStates.add(txnState);
@@ -386,6 +428,7 @@ public class MultiTableTxn2 {
           fileLogs.add(newFileLogs);
           for (DataFileStatus dataFileStatus : dataFiles) {
             fileLogs.get(j).add(new File2(dataFileStatus.getPath(), File2.File2Type.ADD, "data"));
+            createdFiles.add(dataFileStatus.getPath());
           }
 
           CloseableIterator<Row> dataActions = Transaction.generateAppendActions(engine, txnStates.get(j),
@@ -401,19 +444,29 @@ public class MultiTableTxn2 {
 
       Instant afterInsertFiles = Instant.now();
 
-      for (int j = 0 ; j < tableIdxList.size(); j++) {
-        List<File2> curFileLogs = fileLogs.get(j);
+      boolean txnSuccess = false;
+      List<TransactionCommitResult> commitResults = Lists.newArrayList();
+      try {
+        for (int j = 0 ; j < tableIdxList.size(); j++) {
+          List<File2> curFileLogs = fileLogs.get(j);
 
-        TransactionCommitResult commitResult = txns.get(j).commit2(engine, dataActionsIterables.get(j),
-                curFileLogs);
-        List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
-        for (PostCommitHook postCommitHook : postCommitHooks) {
-          try {
-            postCommitHook.threadSafeInvoke(engine);
-          } catch (IOException e) {
-            throw new RuntimeException(e);
+          TransactionCommitResult commitResult = txns.get(j).commit2(engine, dataActionsIterables.get(j),
+                  curFileLogs);
+          commitResults.add(commitResult);
+          List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+          for (PostCommitHook postCommitHook : postCommitHooks) {
+            try {
+              postCommitHook.threadSafeInvoke(engine);
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            }
           }
-        }
+
+          for (File2 file : curFileLogs) {
+            if (file.fileType() == File2.File2Type.ADD && !createdFiles.contains(file.path())) {
+              createdFiles.add(file.path());
+            }
+          }
 
         List<FileObject> newDataFiles = Lists.newArrayList();
         List<String> filesToReplace = Lists.newArrayList();
@@ -437,7 +490,25 @@ public class MultiTableTxn2 {
 
       }
 
-      ravenCatalog.commit(txnId);
+        txnSuccess = ravenCatalog.commit(txnId);
+      } catch (Exception e) {
+        txnSuccess = false;
+        for (List<File2> curFileLogs : fileLogs) {
+          for (File2 file : curFileLogs) {
+            if (file.fileType() == File2.File2Type.ADD && !createdFiles.contains(file.path())) {
+              createdFiles.add(file.path());
+            }
+          }
+        }
+      }
+
+      if (!txnSuccess) {
+        deleteFiles(createdFiles);
+      } else {
+        for (int j = 0; j < tableIdxList.size(); j++) {
+          tableDeltaVersions[tableIdxList.get(j)] = commitResults.get(j).getVersion();
+        }
+      }
 
       Instant afterCommit = Instant.now();
 
@@ -445,9 +516,9 @@ public class MultiTableTxn2 {
       INSERT_FILE_TIMES.add(new TimePair(afterLoadTables, afterInsertFiles));
       COMMIT_TIMES.add(new TimePair(afterInsertFiles, afterCommit));
       // flatten the fileLogs
-      ADDED_FILES.add(fileLogs.stream()
+      ADDED_FILES.add(txnSuccess ? fileLogs.stream()
               .flatMap(List::stream) // or simply Collection::stream
-              .collect(Collectors.toList()));
+              .collect(Collectors.toList()) : Collections.emptyList());
 
     }
 

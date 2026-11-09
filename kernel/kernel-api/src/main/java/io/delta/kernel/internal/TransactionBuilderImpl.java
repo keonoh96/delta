@@ -82,6 +82,8 @@ public class TransactionBuilderImpl implements TransactionBuilder {
   // This would only be set after schema resolution and must align with the resolved schema.
   private Optional<List<Column>> resolvedClusteringColumns = Optional.empty();
 
+  private Optional<Long> readVersion = Optional.empty();
+
   protected final TableImpl table;
   protected Optional<StructType> schema = Optional.empty();
 
@@ -195,13 +197,24 @@ public class TransactionBuilderImpl implements TransactionBuilder {
   }
 
   @Override
+  public TransactionBuilder withReadVersion(long readVersion) {
+    checkArgument(readVersion >= 0, "readVersion must be >= 0");
+    this.readVersion = Optional.of(readVersion);
+    return this;
+  }
+
+  @Override
   public Transaction build(Engine engine) {
     if (operation == Operation.REPLACE_TABLE) {
       throw new UnsupportedOperationException("REPLACE TABLE is not yet supported");
     }
     SnapshotImpl snapshot;
     try {
-      snapshot = (SnapshotImpl) table.getLatestSnapshot(engine);
+      if (readVersion.isPresent()) {
+        snapshot = (SnapshotImpl) table.getSnapshotAsOfVersion(engine, readVersion.get());
+      } else {
+        snapshot = (SnapshotImpl) table.getLatestSnapshot(engine);
+      }
       if (operation == Operation.CREATE_TABLE) {
         throw new TableAlreadyExistsException(table.getPath(engine), "Operation = CREATE_TABLE");
       }

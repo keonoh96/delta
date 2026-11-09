@@ -37,6 +37,7 @@ import io.delta.kernel.engine.Engine;
 import io.delta.kernel.hook.PostCommitHook;
 import io.delta.kernel.types.IntegerType;
 import io.delta.kernel.types.StringType;
+import io.delta.kernel.internal.util.FileNames;
 import io.delta.kernel.types.StructField;
 import io.delta.kernel.types.StructType;
 import io.delta.kernel.utils.CloseableIterable;
@@ -340,21 +341,58 @@ public class ExtendedMORWrite1 {
     MetricsExporter.appendSummaryToJson(summaryFileName);
   }
 
+  private static void deleteFiles(List<String> filePaths) {
+    for (String path : filePaths) {
+      try {
+        s3.delete(path);
+      } catch (Exception e) {
+        // ignore failure to delete
+      }
+    }
+  }
+
   private static void runRavenExpImpl(LocalTime duration) {
     runTaskForDuration(running -> {
       // Keep running until flag change
       int i = 0;
+      int prevVid = 0;
+      long deltaLogVersion = 0L;
       while (running.get()) {
         List<File2> fileLogs = Lists.newArrayList();
+        List<String> createdFiles = Lists.newArrayList();
         Instant beforeLoadTable = Instant.now();
 
-        // Load table. Load from both delta and raven
-        TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.WRITE);
-//        txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
+        TableObject tableObject = ravenCatalog.loadTable(workspaceName, dbName, tableName);
+
+        // retrieve the latest delta log file added by submitting a select filelist delta command
+        // with a range of at least compaction interval + 1
+        if (tableObject.getSnapshotVid() > prevVid) {
+          int startVid = Math.max(0, tableObject.getSnapshotVid() - (txnPerCompaction + 1));
+          int endVid = tableObject.getSnapshotVid();
+          String deltaQuery = String.format(Locale.getDefault(),
+                  "SELECT file_path FROM FILELIST DELTA TableSnapshot(%d, %d, %d)",
+                  tableObject.getSnapshotObjId(), startVid, endVid);
+          byte[] deltaResultSet = ravenCatalog.execQuery(deltaQuery);
+          RavenCatalog.BufIterator deltaBufIter = new RavenCatalog.BufIterator(deltaResultSet);
+          while (deltaBufIter.valid()) {
+            String action = new String(deltaResultSet, deltaBufIter.dataIdx(), deltaBufIter.elemSize(), UTF_8);
+            deltaBufIter.next();
+            String path = new String(deltaResultSet, deltaBufIter.dataIdx(), deltaBufIter.elemSize(), UTF_8);
+            deltaBufIter.next();
+            if ("add".equals(action) && FileNames.isCommitFile(path)) {
+              long ver = FileNames.deltaVersion(path);
+              deltaLogVersion = Math.max(deltaLogVersion, ver);
+            }
+          }
+          prevVid = tableObject.getSnapshotVid();
+        }
+
+        // Load table with respect to retrieved delta log version
+        TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.WRITE)
+                .withReadVersion(deltaLogVersion)
+                .withMaxRetries(0);
         Transaction txn = txnBuilder.build(engine);
         Row txnState = txn.getTransactionState(engine);
-
-        TableObject tableObject = ravenCatalog.loadTable(workspaceName, dbName, tableName);
 
         Instant afterLoadTable = Instant.now();
 
@@ -381,6 +419,7 @@ public class ExtendedMORWrite1 {
         List<FileObject> newFilesList = Lists.newArrayList();
         while (dataFiles.hasNext()) {
           DataFileStatus dataFile = dataFiles.next();
+          createdFiles.add(dataFile.getPath());
           FileObject newFileObject = FileObject.newBuilder().setPath(dataFile.getPath())
                   .setSize((int) dataFile.getSize())
                   .setFormat("parquet").setTag("newdata").build();
@@ -389,7 +428,11 @@ public class ExtendedMORWrite1 {
 
         Instant afterInsertFile = Instant.now();
 
-        ravenCatalog.finalAppendFiles(tableObject, newFilesList);
+        boolean appendSuccess = ravenCatalog.finalAppendFiles(tableObject, newFilesList);
+        if (!appendSuccess) {
+          deleteFiles(createdFiles);
+          continue;
+        }
 
         Instant afterCommit = Instant.now();
         Instant afterCompact = afterCommit;
@@ -397,7 +440,7 @@ public class ExtendedMORWrite1 {
         // perform compaction
         // 1. Get the newdata files, using ExecQuery
         // 2. Read the newdata files, collecting statistics information, using DuckDB.
-        // 3. Commit the newdata files to Iceberg and get the metadata file, manifestlist file, and manifest file.
+        // 3. Commit the newdata files to Delta and get the metadata file, manifestlist file, and manifest file.
         // 4. Replace the newdata files with different tags, Replace the metadata file, manifestlist file, and manifest file.
         if (tableObject.getSnapshotVid() % txnPerCompaction == 0) {
           tableObject = ravenCatalog.loadTable(workspaceName, dbName, tableName);
@@ -445,42 +488,67 @@ public class ExtendedMORWrite1 {
 
           CloseableIterable<Row> dataActionsIterable = CloseableIterable.inMemoryIterable(dataActions);
 
-          TransactionCommitResult commitResult = txn.commit2(engine, dataActionsIterable, fileLogs);
-          List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
-          for (PostCommitHook postCommitHook : postCommitHooks) {
-            try {
-              postCommitHook.threadSafeInvoke(engine);
-            } catch (IOException e) {
-              throw new RuntimeException(e);
+          boolean compactSuccess = true;
+          try {
+            TransactionCommitResult commitResult = txn.commit2(engine, dataActionsIterable, fileLogs);
+            List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+            for (PostCommitHook postCommitHook : postCommitHooks) {
+              try {
+                postCommitHook.threadSafeInvoke(engine);
+              } catch (IOException e) {
+                throw new RuntimeException(e);
+              }
+            }
+
+            for (File2 file : fileLogs) {
+              if (file.fileType() == File2.File2Type.ADD && !createdFiles.contains(file.path())) {
+                createdFiles.add(file.path());
+              }
+            }
+
+            // 4. Replace the newdata files with different tags, add the delta log file (and checkpoint file).
+            List<String> filesToReplace = Lists.newArrayList();
+
+            // newdata files to replace (changing the tags to 'data')
+            for (FileObject file : newDataFiles) {
+              filesToReplace.add(file.getPath());
+            }
+
+            // metadata files (log file and checkpoint file) to add
+            for (File2 file : fileLogs) {
+              switch (file.fileType()) {
+                case ADD:
+                  FileObject newMetadataFileObject = FileObject.newBuilder()
+                          .setTag(file.tag()).setPath(file.path()).build();
+                  // reusing newDataFiles list to hold all new files to add
+                  newDataFiles.add(newMetadataFileObject);
+                  break;
+                case DELETE:
+                  filesToReplace.add(file.path());
+                  break;
+                default:
+                  break;
+              }
+            }
+
+            boolean rewriteSuccess = ravenCatalog.finalRewriteFiles(tableObject, filesToReplace, newDataFiles);
+            if (!rewriteSuccess) {
+              compactSuccess = false;
+            } else {
+              deltaLogVersion = commitResult.getVersion();
+            }
+          } catch (Exception e) {
+            compactSuccess = false;
+            for (File2 file : fileLogs) {
+              if (file.fileType() == File2.File2Type.ADD && !createdFiles.contains(file.path())) {
+                createdFiles.add(file.path());
+              }
             }
           }
 
-          // 4. Replace the newdata files with different tags, add the delta log file (and checkpoint file).
-          List<String> filesToReplace = Lists.newArrayList();
-
-          // newdata files to replace (changing the tags to 'data')
-          for (FileObject file : newDataFiles) {
-            filesToReplace.add(file.getPath());
+          if (!compactSuccess) {
+            deleteFiles(createdFiles);
           }
-
-          // metadata files (log file and checkpoint file) to add
-          for (File2 file : fileLogs) {
-            switch (file.fileType()) {
-              case ADD:
-                FileObject newMetadataFileObject = FileObject.newBuilder()
-                        .setTag(file.tag()).setPath(file.path()).build();
-                // reusing newDataFiles list to hold all new files to add
-                newDataFiles.add(newMetadataFileObject);
-                break;
-              case DELETE:
-                filesToReplace.add(file.path());
-                break;
-              default:
-                break;
-            }
-          }
-
-          ravenCatalog.finalRewriteFiles(tableObject, filesToReplace, newDataFiles);
 
           afterCompact = Instant.now();
         }

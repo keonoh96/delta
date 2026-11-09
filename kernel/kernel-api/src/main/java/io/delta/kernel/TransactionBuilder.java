@@ -167,6 +167,15 @@ public interface TransactionBuilder {
   TransactionBuilder withDomainMetadataSupported();
 
   /**
+   * Set the read version of the transaction. The transaction will read the snapshot as of this version
+   * instead of the latest snapshot.
+   *
+   * @param readVersion The snapshot version to read.
+   * @return updated {@link TransactionBuilder} instance.
+   */
+  TransactionBuilder withReadVersion(long readVersion);
+
+  /**
    * Build the transaction. Also validates the given info to ensure that a valid transaction can be
    * created.
    *
